@@ -1,0 +1,434 @@
+You are a senior Python backend engineer. Convert the attached n8n workflow JSON into a production-ready Python backend while preserving all current workflow functionality, logic, integrations, prompts, branching, data structures, and behavior.
+
+The attached file is an n8n workflow named:
+"Universal AI Lead Management - Final"
+
+Your task:
+Build a Python implementation of this workflow as a FastAPI application.
+
+Very important:
+Do not simplify the workflow.
+Do not remove features.
+Do not replace business logic with placeholders unless credentials are required.
+Read the workflow JSON carefully and port the actual node logic into Python.
+
+Core functionality to preserve:
+
+1. Meta Webhook Handling
+- Implement POST /meta-webhook for Meta Messenger / Instagram webhook events.
+- Implement GET /meta-webhook for Meta webhook verification.
+- Verification token should be configurable via env, defaulting to the token used in the workflow.
+- For GET verification:
+  - Check hub.mode == subscribe
+  - Check hub.verify_token
+  - Return hub.challenge as plain text if valid
+  - Return "Invalid token" if invalid
+- For POST:
+  - Accept Meta page webhook payloads only when body.object == "page"
+  - Parse Messenger / Instagram DM events
+  - Parse Facebook / Instagram comment events
+  - Extract:
+    - platform
+    - pageId
+    - senderId
+    - senderName
+    - messageText
+    - timestamp
+    - eventId
+    - commentId if available
+    - rawMessageMid
+    - replyToMid
+    - isReplyToBotMessage
+
+2. Client Config Lookup
+- Use MongoDB collection: clients
+- Find client config by pageId.
+- Preserve fields:
+  - clientName
+  - pageId
+  - accessToken
+  - businessType
+  - products
+  - location
+  - imageFolder
+- If client config is missing, raise a controlled error.
+
+3. Product Lookup
+- Use MongoDB collection: products
+- Query by clientId from the matched client config.
+- Preserve product fields:
+  - _id
+  - productName
+  - price
+  - description
+  - status
+  - imagePath
+- Normalize products into the same structure used by the workflow:
+  - id
+  - name
+  - price
+  - description
+  - status
+
+4. Conversation Memory
+- Use MongoDB collection: conversation_memory
+- Fetch recent conversation history for the same clientId and senderId.
+- Sort by timestamp descending in Mongo query, then assemble chronological recent history as the workflow does.
+- Keep the last 6 relevant turns for AI context.
+- Build:
+  - conversationHistory
+  - conversationContext as human-readable memory
+  - lastAssistantMessage
+- Also preserve vector-memory capability from the n8n workflow:
+  - The workflow uses MongoDB Atlas Vector Store + OpenAI embeddings.
+  - Implement a Python service for optional semantic memory lookup.
+  - Use OpenAI embeddings and MongoDB Atlas vector search if configured.
+  - Make it optional/configurable so the app can still run without vector search.
+
+5. Pending Follow-up Cancellation
+- Use MongoDB collection: pending_followups
+- When a user sends a new message, find pending followups for:
+  - clientId
+  - senderId
+  - status = pending
+- Mark them:
+  - status = cancelled
+  - cancelledAt = current timestamp in ms
+  - cancelReason = user_replied
+
+6. Outbound Message Threading
+- Use MongoDB collection: outbound_messages
+- If incoming message has replyToMid, look up outbound_messages by:
+  - messageId = replyToMid
+  - senderId
+  - platform
+- Use this to infer repliedProduct.
+- Preserve the workflow’s replied product override behavior.
+
+7. AI Intent Classifier
+- Use OpenAI Responses API, model:
+  - gpt-4o-mini-2024-07-18
+- Extract the exact system/user prompts from the n8n nodes:
+  - "Intent classifier"
+- Port all classification instructions exactly.
+- The classifier must output JSON.
+- Parse classifier JSON safely.
+- Implement the same lead status state machine:
+  - If intent == general:
+    - leadStatus = none
+  - qualifyingIntents:
+    - catalog_request
+    - price_inquiry
+    - product_inquiry
+  - Default leadStatus = new
+  - If current intent is qualifying and past qualifying interactions >= 1:
+    - leadStatus = warm
+  - If intent == booking:
+    - leadStatus = hot
+  - If intent == not_interested:
+    - leadStatus = closed
+
+8. Persona and Response AI
+- Use OpenAI Responses API, model:
+  - gpt-4o-mini-2024-07-18
+- Extract the exact system/user prompts from the n8n node:
+  - "Persona and response"
+- Preserve all behavior:
+  - Rajver Patel persona
+  - sales manager tone
+  - conversation continuity
+  - language style rules
+  - booking detail collection rules
+  - replied product override
+  - image handling rules
+  - no markdown in user-facing replies
+  - intent must not be reclassified
+  - output must be JSON where expected
+- The AI response parser must:
+  - Strip ```json fences
+  - Extract JSON object from model text
+  - Parse JSON safely
+  - Raise useful errors when invalid
+- Expected AI fields include:
+  - reply
+  - intent
+  - isLead
+  - followUpTiming
+  - followUpReason
+  - productReferences
+  - imageProducts
+  - sendImages
+  - leadStatus
+  - languageStyle
+- Compute:
+  - shouldSendImages = sendImages is true AND imageProducts is a non-empty list
+
+9. Send Product Images
+- If shouldSendImages is true:
+  - For every product listed in ai.imageProducts:
+    - Match against fetched products case-insensitively.
+    - Resolve imagePath.
+    - If imagePath starts with http, use it directly.
+    - Else combine client.imageFolder + "/" + imagePath.
+  - Send each image separately to Meta Graph API.
+  - Endpoint pattern:
+    - https://graph.facebook.com/v18.0/{pageId}/messages?access_token={client.accessToken}
+  - Body:
+    - recipient: { id: senderId }
+    - message.attachment.type = image
+    - message.attachment.payload.url = imageUrl
+    - is_reusable = true
+- After sending image, store outbound message in outbound_messages:
+  - clientId
+  - platform
+  - senderId
+  - messageId from Meta response
+  - messageType = image
+  - product
+  - intent
+  - createdAt
+
+10. Send Text Reply
+- Always send the AI reply text to Meta Graph API.
+- Endpoint:
+  - https://graph.facebook.com/v18.0/{pageId}/messages?access_token={client.accessToken}
+- Body:
+  - recipient: { id: senderId }
+  - message: { text: ai.reply }
+- After sending text, store outbound message in outbound_messages:
+  - clientId
+  - platform
+  - senderId
+  - messageId from Meta response
+  - messageType = text
+  - messageText = ai.reply
+  - intent
+  - createdAt
+
+11. Google Sheets Lead Logging
+- Preserve the "Log Lead" node behavior.
+- Append a row to the configured Google Sheet.
+- Use service account credentials or OAuth credentials via env/config.
+- Columns:
+  - Timestamp
+  - ClientName
+  - Platform
+  - SenderID
+  - Message
+  - SenderName
+  - Intent
+  - IsLead
+  - FollowUpTiming
+  - ProductReferences
+  - LeadStatus
+- Sheet ID should be configurable, defaulting to the one in the workflow.
+- Sheet name/tab should be configurable.
+
+12. Conversation Memory Insert
+- If the lead condition passes:
+  - IsLead == true
+  - Intent != general
+  - LeadStatus != closed
+- Insert lead-style memory into conversation_memory:
+  - clientId
+  - senderId
+  - text:
+    "User showed interest in {products}.\n     Intent: {intent}.\n     Lead status: {leadStatus}.\n     User message: \"{messageText}\""
+  - user_message
+  - ai_reply
+  - intent
+  - languageStyle
+  - platform
+  - timestamp
+- Else insert normal conversation memory:
+  - clientId
+  - senderId
+  - user_message
+  - ai_reply
+  - intent
+  - languageStyle
+  - platform
+  - timestamp
+
+13. Follow-up Scheduling
+- Preserve "Follow-up Needed?" logic:
+  - If ai.followUpTiming != "none", schedule follow-up.
+- The n8n workflow uses Wait node with:
+  - 2 hours if followUpTiming == "2h"
+  - otherwise 24 hours
+- Do not use blocking sleeps inside request handlers.
+- Implement durable scheduled followups using one of:
+  - APScheduler
+  - Celery
+  - RQ
+  - a background scheduler loop with MongoDB dueAt polling
+- Prefer a durable MongoDB-backed scheduler.
+- Insert into pending_followups:
+  - followUpId = clientId + "_" + senderId + "_" + current timestamp ms
+  - clientId
+  - senderId
+  - status = pending
+  - createdAt
+  - dueAt
+  - cancelReason = ""
+  - platform
+  - intent
+  - languageStyle
+  - timestamp
+- A scheduler must periodically find due pending followups:
+  - status = pending
+  - dueAt <= now
+- Before sending, re-check it still exists and status == pending.
+- If pending, generate follow-up AI response.
+
+14. Follow-up AI
+- Use OpenAI Responses API, model:
+  - gpt-4o-mini-2024-07-18
+- Extract exact prompts from the n8n node:
+  - "Followup Model"
+- Preserve all follow-up rules:
+  - output plain text only
+  - no JSON
+  - 1–2 short sentences
+  - no banned phrases
+  - match languageStyle exactly
+  - specific question only if needed
+- Parse follow-up response as plain text.
+- If empty, raise controlled error.
+- Send follow-up through Meta Graph API.
+- Store outbound follow-up message in outbound_messages:
+  - clientId
+  - platform
+  - senderId
+  - messageId
+  - messageType = followup
+  - messageText
+  - intent = followup
+  - createdAt
+- After successful send, update pending_followups status to sent and sentAt.
+
+15. API Response
+- POST /meta-webhook should respond quickly with:
+  - { "success": true, "message": "Processed successfully" }
+- Use background processing if needed so Meta does not time out.
+- Still ensure errors are logged.
+
+16. Project Structure
+Create a clean Python project:
+
+app/
+  main.py
+  config.py
+  models/
+    meta.py
+    ai.py
+    lead.py
+  services/
+    meta_parser.py
+    client_service.py
+    product_service.py
+    memory_service.py
+    outbound_service.py
+    followup_service.py
+    sheets_service.py
+    openai_service.py
+    graph_api_service.py
+  repositories/
+    mongo.py
+  workers/
+    followup_worker.py
+  utils/
+    time.py
+    json_parser.py
+    logging.py
+  tests/
+    test_meta_parser.py
+    test_ai_json_parser.py
+    test_lead_status.py
+    test_image_path_resolution.py
+    test_followup_cancellation.py
+requirements.txt
+.env.example
+README.md
+
+17. Environment Variables
+Create .env.example with:
+
+APP_ENV=local
+PORT=8000
+
+META_VERIFY_TOKEN=verify123
+META_GRAPH_API_VERSION=v18.0
+
+MONGODB_URI=
+MONGODB_DB_NAME=
+
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4o-mini-2024-07-18
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+
+GOOGLE_SHEETS_CREDENTIALS_JSON=
+GOOGLE_SHEETS_ID=1wngP0-Seu5aZrYift8X-ZLUdvq2_ntKBzjEa6wPtpSw
+GOOGLE_SHEETS_TAB=Sheet1
+
+ENABLE_VECTOR_MEMORY=false
+MONGO_VECTOR_INDEX_NAME=conversation_memory_vector
+
+FOLLOWUP_WORKER_ENABLED=true
+FOLLOWUP_POLL_INTERVAL_SECONDS=30
+
+18. Code Quality Requirements
+- Use async FastAPI.
+- Use httpx.AsyncClient for Meta Graph API.
+- Use motor for async MongoDB.
+- Use Pydantic models for parsed/normalized payloads.
+- Use structured logging.
+- Add retry handling for Meta/OpenAI/Google Sheets where appropriate.
+- Do not hardcode secrets.
+- Keep all prompts in a dedicated prompts.py file or load them from extracted workflow JSON constants.
+- Preserve exact prompt content from the workflow.
+- Include robust error handling for:
+  - malformed Meta payloads
+  - missing client config
+  - invalid AI JSON
+  - failed Meta send
+  - failed Google Sheets append
+  - missing OpenAI output
+  - missing product imagePath
+
+19. Tests
+Write tests for:
+- Messenger payload parsing
+- Comment payload parsing
+- Meta GET verification success/failure
+- AI JSON parser removing markdown fences
+- Lead status computation
+- Follow-up pending cancellation
+- Image path resolution
+- Outbound message storage payload
+- Follow-up due worker behavior
+
+20. README
+Write a README with:
+- What this app does
+- How it maps from the n8n workflow
+- Setup instructions
+- Environment variables
+- How to run locally
+- How to expose webhook using ngrok
+- How to configure Meta webhook
+- How to run tests
+- MongoDB collections and expected schemas
+- Deployment notes
+
+Important implementation instruction:
+Before coding, parse the attached workflow JSON and create a workflow mapping document in README or docs/workflow_mapping.md listing every n8n node and the Python function/module that replaces it.
+
+Expected output from you:
+- Full Python project files.
+- Working FastAPI app.
+- No pseudocode.
+- No missing core functionality.
+- All n8n JavaScript logic converted to Python.
+- All OpenAI prompts preserved.
+- All MongoDB, Google Sheets, Meta Graph API, AI classification, AI response, image sending, outbound message logging, conversation memory, pending follow-up, and scheduled follow-up capabilities retained.
